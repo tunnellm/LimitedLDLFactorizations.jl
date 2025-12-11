@@ -22,6 +22,7 @@ The modified version is described in [3,4].
 module LimitedLDLFactorizations
 
 export lldl,
+  lldl_spd,
   lldl_factorize!,
   \,
   ldiv!,
@@ -29,7 +30,8 @@ export lldl,
   LimitedLDLFactorization,
   factorized,
   update_shift!,
-  update_shift_increase_factor!
+  update_shift_increase_factor!,
+  update_force_posdef!
 
 using AMD, LinearAlgebra, SparseArrays
 
@@ -76,6 +78,7 @@ mutable struct LimitedLDLFactorization{
   neg::Vector{Int}
 
   computed_posneg::Bool # true if pos and neg are computed (becomes false after factorization)
+  force_posdef::Bool # if true, enforce positive definiteness by shifting when D has non-positive entries
 end
 
 """
@@ -109,6 +112,18 @@ function update_shift_increase_factor!(
   LLDL
 end
 
+"""
+    update_force_posdef!(LLDL, force_posdef)
+
+Updates the `force_posdef` flag of the `LimitedLDLFactorization` object `LLDL`.
+When `force_posdef` is `true`, the factorization will add shift to ensure all
+diagonal entries of D are positive.
+"""
+function update_force_posdef!(LLDL::LimitedLDLFactorization, force_posdef::Bool)
+  LLDL.force_posdef = force_posdef
+  LLDL
+end
+
 function LimitedLDLFactorization(
   T::SparseMatrixCSC{Tv, Ti},
   P::AbstractVector{<:Integer},
@@ -118,6 +133,7 @@ function LimitedLDLFactorization(
   n::Int,
   nnzT::Int,
   ::Type{Tf},
+  force_posdef::Bool,
 ) where {Tv <: Number, Ti, Tf <: Real}
   np = n * memory
   Pinv = similar(P)
@@ -149,8 +165,13 @@ function LimitedLDLFactorization(
   indf = Vector{Ti}(undef, n)  # indf[col] = position in w of the next entry in column col to be used during the factorization.
   list = zeros(Ti, n)  # list[col] = linked list of columns that will update column col.
 
-  pos = findall(adiag[P] .> Tf(0))
-  neg = findall(adiag[P] .≤ Tf(0))
+  if force_posdef
+    pos = collect(1:n)
+    neg = Int[]
+  else
+    pos = findall(adiag[P] .> Tf(0))
+    neg = findall(adiag[P] .≤ Tf(0))
+  end
 
   Lrowind = view(rowind, 1:nnzLmax)
   Lnzvals = view(lvals, 1:nnzLmax)
@@ -181,14 +202,15 @@ function LimitedLDLFactorization(
     pos,
     neg,
     true,
+    force_posdef,
   )
 end
 
 """
-    LLDL = LimitedLDLFactorization(T; P = amd(T), memory = 0, α = 0, α_increase_factor = 10)
-    LLDL = LimitedLDLFactorization(T, ::Type{Tf}; P = amd(T), memory = 0, α = 0, α_increase_factor = 10)
+    LLDL = LimitedLDLFactorization(T; P = amd(T), memory = 0, α = 0, α_increase_factor = 10, force_posdef = false)
+    LLDL = LimitedLDLFactorization(T, ::Type{Tf}; P = amd(T), memory = 0, α = 0, α_increase_factor = 10, force_posdef = false)
 
-Perform the allocations for the LLDL factorization of symmetric matrix whose lower triangle is `T` 
+Perform the allocations for the LLDL factorization of symmetric matrix whose lower triangle is `T`
 with the permutation vector `P`.
 
 # Arguments
@@ -203,9 +225,11 @@ with the permutation vector `P`.
 - `α::Number=0`: initial value of the shift in case the incomplete LDLᵀ
                  factorization of `A` is found to not exist. The shift will be
                  gradually increased from this initial value until success;
-- `α_increase_factor::Number=10`: value by which the shift will be increased after 
+- `α_increase_factor::Number=10`: value by which the shift will be increased after
                                   the incomplete LDLᵀ factorization of `T` is found
-                                  to not exist.
+                                  to not exist;
+- `force_posdef::Bool=false`: if true, enforce positive definiteness by adding shift
+                              when any diagonal entry of D becomes non-positive.
 
 # Example
     A = sprand(Float64, 10, 10, 0.2)
@@ -220,11 +244,22 @@ function LimitedLDLFactorization(
   memory::Int = 0,
   α::Number = 0,
   α_increase_factor::Number = 10,
+  force_posdef::Bool = false,
 ) where {Tv <: Number, Ti <: Integer, Tf <: Real}
   memory < 0 && error("limited-memory parameter must be nonnegative")
   n = size(T, 1)
   n != size(T, 2) && error("input matrix must be square")
-  return LimitedLDLFactorization(T, P, memory, Tf(α), Tf(α_increase_factor), n, nnz(T), Tf)
+  return LimitedLDLFactorization(
+    T,
+    P,
+    memory,
+    Tf(α),
+    Tf(α_increase_factor),
+    n,
+    nnz(T),
+    Tf,
+    force_posdef,
+  )
 end
 
 LimitedLDLFactorization(T::SparseMatrixCSC{Tv, Ti}; kwargs...) where {Tv <: Number, Ti <: Integer} =
@@ -327,9 +362,9 @@ function lldl_factorize!(
 
   pos = S.pos
   neg = S.neg
-  cpos = 0
-  cneg = 0
-  if !(S.computed_posneg)
+  if !S.force_posdef && !S.computed_posneg
+    cpos = 0
+    cneg = 0
     for i = 1:n
       adiagPi = adiag[P[i]]
       if adiagPi > Tf(0)
@@ -403,6 +438,7 @@ function lldl_factorize!(
       list,
       memory = Ti(memory),
       droptol = droptol,
+      force_posdef = S.force_posdef,
     )
 
     # Increase shift if the factorization didn't succeed.
@@ -434,8 +470,8 @@ function lldl_factorize!(
 end
 
 """
-    lldl(A; P = amd(A), memory = 0, α = 0, droptol = 0, check_tril = true)
-    lldl(A, ::Type{Tf}; P = amd(A), memory = 0, α = 0, droptol = 0, check_tril = true)
+    lldl(A; P = amd(A), memory = 0, α = 0, droptol = 0, check_tril = true, force_posdef = false)
+    lldl(A, ::Type{Tf}; P = amd(A), memory = 0, α = 0, droptol = 0, check_tril = true, force_posdef = false)
 
 Compute the limited-memory LDLᵀ factorization of `A`.
 `A` should be a lower triangular matrix.
@@ -453,12 +489,14 @@ Compute the limited-memory LDLᵀ factorization of `A`.
 - `α::Number=0`: initial value of the shift in case the incomplete LDLᵀ
                  factorization of `A` is found to not exist. The shift will be
                  gradually increased from this initial value until success;
-- `α_increase_factor::Number = 10`: value by which the shift will be increased after 
+- `α_increase_factor::Number = 10`: value by which the shift will be increased after
                                     the incomplete LDLᵀ factorization of `T` is found
-                                    to not exist.
+                                    to not exist;
 - `droptol::Tv=Tv(0)`: to further sparsify `L`, all elements with magnitude smaller
                        than `droptol` are dropped;
-- `check_tril::Bool = true`: check if `A` is a lower triangular matrix.
+- `check_tril::Bool = true`: check if `A` is a lower triangular matrix;
+- `force_posdef::Bool=false`: if true, enforce positive definiteness by adding shift
+                              when any diagonal entry of D becomes non-positive.
 
 # Example
     A = sprand(Float64, 10, 10, 0.2)
@@ -477,6 +515,7 @@ function lldl(
   α::Number = 0,
   α_increase_factor::Number = 10,
   check_tril::Bool = true,
+  force_posdef::Bool = false,
 ) where {Tv <: Number, Ti <: Integer, Tf <: Real}
   T = (!check_tril || istril(A)) ? A : tril(A)
   S = LimitedLDLFactorization(
@@ -486,6 +525,7 @@ function lldl(
     memory = memory,
     α = α,
     α_increase_factor = α_increase_factor,
+    force_posdef = force_posdef,
   )
   lldl_factorize!(S, T, droptol = Tf(droptol))
 end
@@ -505,6 +545,21 @@ function lldl(
   lldl(A; kwargs...)
 end
 
+"""
+    lldl_spd(A; kwargs...)
+    lldl_spd(A, ::Type{Tf}; kwargs...)
+
+Compute the limited-memory LDLᵀ factorization of `A` with positive definiteness enforced.
+This is equivalent to calling `lldl(A; force_posdef=true, kwargs...)`.
+
+All diagonal entries of D will be positive. If the factorization would produce a
+non-positive diagonal entry, a shift is applied and the factorization is retried.
+
+See [`lldl`](@ref) for the full list of keyword arguments.
+"""
+lldl_spd(A; kwargs...) = lldl(A; force_posdef = true, kwargs...)
+lldl_spd(A, ::Type{Tf}; kwargs...) where {Tf} = lldl(A, Tf; force_posdef = true, kwargs...)
+
 function attempt_lldl!(
   nnzT::Int,
   d::Vector{Tv},
@@ -517,6 +572,7 @@ function attempt_lldl!(
   list::Vector{Ti};
   memory::Ti = 0,
   droptol::Tv = Tv(0),
+  force_posdef::Bool = false,
 ) where {Ti <: Integer, Tv <: Number}
   fill!(list, 0)
   fill!(indf, 0)
@@ -541,9 +597,9 @@ function attempt_lldl!(
   # Scan each column in turn.
   for col = 1:n
 
-    # The factorization fails if the current pivot is zero.
+    # The factorization fails if the current pivot is zero (or non-positive when force_posdef).
     dcol = d[col]
-    dcol == 0 && return false
+    (force_posdef ? dcol <= 0 : dcol == 0) && return false
 
     # Load column col of A into w.
     col_end = colptr[col + 1] - one(Ti)
