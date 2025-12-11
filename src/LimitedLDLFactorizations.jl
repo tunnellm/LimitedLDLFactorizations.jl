@@ -79,6 +79,7 @@ mutable struct LimitedLDLFactorization{
 
   computed_posneg::Bool # true if pos and neg are computed (becomes false after factorization)
   force_posdef::Bool # if true, enforce positive definiteness by shifting when D has non-positive entries
+  flops::Int # number of floating-point operations performed during factorization
 end
 
 """
@@ -203,6 +204,7 @@ function LimitedLDLFactorization(
     neg,
     true,
     force_posdef,
+    0,
   )
 end
 
@@ -353,6 +355,7 @@ function lldl_factorize!(
 
   factorized = false
   tired = false
+  total_flops = 0
 
   # Work arrays.
   w = S.w    # contents of the current column of A.
@@ -426,7 +429,7 @@ function lldl_factorize!(
     end
 
     # Attempt a factorization.
-    factorized = attempt_lldl!(
+    (factorized, flops) = attempt_lldl!(
       nnzT_nodiag,
       d,
       lvals,
@@ -440,6 +443,7 @@ function lldl_factorize!(
       droptol = droptol,
       force_posdef = S.force_posdef,
     )
+    total_flops += flops
 
     # Increase shift if the factorization didn't succeed.
     if !factorized
@@ -450,6 +454,7 @@ function lldl_factorize!(
   end
 
   S.__factorized = factorized
+  S.flops = total_flops
 
   # Unscale L.
   if factorized
@@ -579,6 +584,7 @@ function attempt_lldl!(
   n = size(d, 1)
   np = n * memory
   droptol = max(0, droptol)
+  flops = 0
 
   # Make room for L.
   @inbounds @simd for col = 1:(n + 1)
@@ -599,7 +605,7 @@ function attempt_lldl!(
 
     # The factorization fails if the current pivot is zero (or non-positive when force_posdef).
     dcol = d[col]
-    (force_posdef ? dcol <= 0 : dcol == 0) && return false
+    (force_posdef ? dcol <= 0 : dcol == 0) && return (false, flops)
 
     # Load column col of A into w.
     col_end = colptr[col + 1] - one(Ti)
@@ -625,6 +631,7 @@ function attempt_lldl!(
       kth_col_end = colptr[k + 1] - one(Ti)
       lval = lvals[kth_col_start]  # lval = L[col, k].
       dl = -d[k] * lval
+      flops += 1  # 1 multiply for dl
 
       newk = list[k]
       kth_col_start += one(Ti)
@@ -647,6 +654,7 @@ function attempt_lldl!(
           indr[nzcol] = row
           w[row] = dli
         end
+        flops += 1  # 1 FMA (multiply-add) for dli computation and accumulation
       end
 
       k = newk
@@ -657,6 +665,7 @@ function attempt_lldl!(
       w[indr[k]] /= dcol
       # d[row] -= d[col] * w[row] * w[row];  # Variant I.
     end
+    flops += nzcol  # 1 division per element
 
     nz_to_keep = min(col_end - col_start + one(Ti) + memory, nzcol)
     kth = nzcol - nz_to_keep + one(Ti)
@@ -693,6 +702,7 @@ function attempt_lldl!(
       wk1 = w[k1]
       d[k1] -= dcol * wk1 * wk1
     end
+    flops += 2 * (nzcol - kth + 1)  # 2 ops per element: 1 mul + 1 FMA
 
     if new_col_start < new_col_end
       indf[col] = new_col_start
@@ -708,7 +718,7 @@ function attempt_lldl!(
     colptr[col + 1] = new_col_end + one(Ti)
   end
 
-  return true
+  return (true, flops)
 end
 
 """Permute the elements of `keys` in place so that
