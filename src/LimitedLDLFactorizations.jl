@@ -80,6 +80,8 @@ mutable struct LimitedLDLFactorization{
   computed_posneg::Bool # true if pos and neg are computed (becomes false after factorization)
   force_posdef::Bool # if true, enforce positive definiteness by shifting when D has non-positive entries
   flops::Int # number of floating-point operations performed during factorization
+  graph_ops::Int # number of graph operations (marker sets, linked list ops, fill-in, sorting)
+  solve_flops::Int # number of floating-point operations per solve (2*nnz(L) + n)
 end
 
 """
@@ -204,7 +206,9 @@ function LimitedLDLFactorization(
     neg,
     true,
     force_posdef,
-    0,
+    0,  # flops
+    0,  # graph_ops
+    0,  # solve_flops
   )
 end
 
@@ -356,6 +360,16 @@ function lldl_factorize!(
   factorized = false
   tired = false
   total_flops = 0
+  total_graph_ops = 0
+
+  # Graph ops for setup phase (done once before retry loop)
+  # Note: Inverse permutation (Pinv stores) and diagonal extraction (trivial CSC read)
+  # are NOT counted - only structural manipulations count as graph ops
+
+  # Flops for scaling computation (done once before retry loop)
+  # Inner loop (lines 328-338): val*val + 2 adds per off-diag entry = 3 * nnzT_nodiag
+  # Outer loop (lines 340-345): 1 FMA + 1 sqrt + 1 sqrt + 1 div per col = 4n
+  total_flops += 3 * nnzT_nodiag + 4 * n
 
   # Work arrays.
   w = S.w    # contents of the current column of A.
@@ -393,12 +407,14 @@ function lldl_factorize!(
         indr[min(Pinv[row], Pinv[col])] += one(Ti)
       end
     end
+    total_graph_ops += nnzT_nodiag  # index reads for sparsity structure copy
     # cumulative sum
     colptr[1] = one(Ti)
     @inbounds for col = 1:n
       colptr[col + 1] = indr[col] + colptr[col]
       indr[col] = colptr[col]
     end
+    total_graph_ops += n  # colptr prefix sum
 
     # Store the scaled A into L.
     # Make room to store the computed factors.
@@ -420,6 +436,10 @@ function lldl_factorize!(
         indr[min(pinvrow, pinvcol)] += one(Ti)
       end
     end
+    total_graph_ops += nnzT_nodiag  # index stores for scaled A into L
+    # Scaling flops: d[col] = adiag*scol*scol = 2 muls per col
+    #                lvals[q] = nzval*scol*s[row] = 2 muls per off-diag entry
+    total_flops += 2 * n + 2 * nnzT_nodiag
 
     @inbounds @simd for col in pos
       d[col] += α
@@ -429,7 +449,7 @@ function lldl_factorize!(
     end
 
     # Attempt a factorization.
-    (factorized, flops) = attempt_lldl!(
+    (factorized, flops, graph_ops) = attempt_lldl!(
       nnzT_nodiag,
       d,
       lvals,
@@ -444,6 +464,7 @@ function lldl_factorize!(
       force_posdef = S.force_posdef,
     )
     total_flops += flops
+    total_graph_ops += graph_ops
 
     # Increase shift if the factorization didn't succeed.
     if !factorized
@@ -454,7 +475,6 @@ function lldl_factorize!(
   end
 
   S.__factorized = factorized
-  S.flops = total_flops
 
   # Unscale L.
   if factorized
@@ -465,10 +485,18 @@ function lldl_factorize!(
         lvals[k] *= scol / s[rowind[k]]
       end
     end
+    # Unscaling flops: d[col] /= scol*scol = 1 mul + 1 div per col
+    #                  lvals[k] *= scol/s[...] = 1 div + 1 mul per entry
+    nnzL = colptr[n + 1] - 1
+    total_flops += 2 * n + 2 * nnzL
   end
 
-  S.α_out = α
+  S.flops = total_flops
+  S.graph_ops = total_graph_ops
+  # Solve flops: lldl_lsolve (nnz(L) FMAs) + lldl_dsolve (n divs) + lldl_ltsolve (nnz(L) FMAs)
   nz = colptr[end] - 1
+  S.solve_flops = factorized ? 2 * nz + n : 0
+  S.α_out = α
   S.Lrowind = view(rowind, 1:nz)
   S.Lnzvals = view(lvals, 1:nz)
   return S
@@ -585,16 +613,19 @@ function attempt_lldl!(
   np = n * memory
   droptol = max(0, droptol)
   flops = 0
+  graph_ops = 0
 
   # Make room for L.
   @inbounds @simd for col = 1:(n + 1)
     colptr[col] += np
   end
+  graph_ops += n + 1  # colptr shifts
 
   @inbounds @simd for k = nnzT:-1:1
     rowind[np + k] = rowind[k]
     lvals[np + k] = lvals[k]
   end
+  graph_ops += nnzT  # index shifts
 
   # Attempt an incomplete LDL factorization.
   col_start = colptr[1]
@@ -605,17 +636,20 @@ function attempt_lldl!(
 
     # The factorization fails if the current pivot is zero (or non-positive when force_posdef).
     dcol = d[col]
-    (force_posdef ? dcol <= 0 : dcol == 0) && return (false, flops)
+    (force_posdef ? dcol <= 0 : dcol == 0) && return (false, flops, graph_ops)
 
     # Load column col of A into w.
     col_end = colptr[col + 1] - one(Ti)
     nzcol = zero(Ti)
     @inbounds for k = col_start:col_end
       row = rowind[k]
+      graph_ops += 1  # index read from rowind
       w[row] = lvals[k]  # w[row] = A[row, col] for each col in turn.
       nzcol += one(Ti)
       indr[nzcol] = row
+      graph_ops += 1  # index store to indr
       indf[row] = one(Ti)
+      graph_ops += 1  # marker store
     end
 
     # nzcol = number of nonzeros in current column.
@@ -637,21 +671,27 @@ function attempt_lldl!(
       kth_col_start += one(Ti)
       if kth_col_start < kth_col_end
         row = rowind[kth_col_start]
+        graph_ops += 1  # index read for linked list relink
         indf[k] = kth_col_start
         list[k] = list[row]
         list[row] = k
+        graph_ops += 3  # linked list relink: 3 stores
       end
 
       # Perform the update L[row, col] <- L[row, col] - D[k, k] * L[col, k] * L[row, k].
       @inbounds for i = kth_col_start:kth_col_end
         row = rowind[i]
+        graph_ops += 1  # index read from rowind
         dli = dl * lvals[i]
         if indf[row] != 0
           w[row] += dli  # w[row] = L[row, col], lval = L[col, k], lvals[i] = L[row, k].
         else
+          # Fill-in discovery
           indf[row] = one(Ti)
+          graph_ops += 1  # marker store for new fill
           nzcol += one(Ti)
           indr[nzcol] = row
+          graph_ops += 1  # index store for new fill
           w[row] = dli
         end
         flops += 1  # 1 FMA (multiply-add) for dli computation and accumulation
@@ -672,13 +712,19 @@ function attempt_lldl!(
 
     if nzcol ≥ 1
       # Determine the kth smallest elements in current column
+      # abspermute is quickselect: O(nzcol) expected, count as linear
       abspermute!(w, view(indr, 1:nzcol), kth)
+      graph_ops += nzcol  # quickselect: linear cost
       # At this point, w[indr[1:nzcol]] is partially sorted in increasing order of absolute
       # values. The kth smallest element of w in absolute value is in w[indr[kth]].
 
       # Sort the row indices of the nz_to_keep largest elements
       # so we can later retrieve L[i,k] from indf[k].
       sort!(indr, kth, nzcol, nz_to_keep ≤ 50 ? InsertionSort : MergeSort, Base.Order.Forward)
+      # Full sort: n*log2(n) comparisons
+      if nz_to_keep > 1
+        graph_ops += ceil(Int, nz_to_keep * log2(nz_to_keep))
+      end
     end
 
     new_col_start = colptr[col]
@@ -686,11 +732,13 @@ function attempt_lldl!(
     l = new_col_start
     @inbounds @simd for k = new_col_start:new_col_end
       k1 = indr[kth + k - new_col_start]
+      graph_ops += 1  # index read from indr
       val = w[k1]
       # record element unless it should be dropped
       if abs(val) > droptol
         lvals[l] = val
         rowind[l] = k1
+        graph_ops += 1  # index store to rowind
         l += one(Ti)
       end
     end
@@ -707,18 +755,22 @@ function attempt_lldl!(
     if new_col_start < new_col_end
       indf[col] = new_col_start
       row1 = rowind[new_col_start]
+      graph_ops += 1  # index read for linked list setup
       list[col] = list[row1]
       list[row1] = col
+      graph_ops += 2  # linked list setup: 2 stores
     end
 
     @inbounds @simd for k = 1:nzcol
       indf[indr[k]] = zero(Ti)
     end
+    graph_ops += nzcol  # marker clears
+
     col_start = colptr[col + 1]
     colptr[col + 1] = new_col_end + one(Ti)
   end
 
-  return (true, flops)
+  return (true, flops, graph_ops)
 end
 
 """Permute the elements of `keys` in place so that
