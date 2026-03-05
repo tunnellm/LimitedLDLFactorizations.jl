@@ -79,6 +79,7 @@ mutable struct LimitedLDLFactorization{
 
   computed_posneg::Bool # true if pos and neg are computed (becomes false after factorization)
   force_posdef::Bool # if true, enforce positive definiteness by shifting when D has non-positive entries
+  num_retries::Int # number of shift-increase retries before factorization succeeded (0 = first try)
   flops::Int # number of floating-point operations performed during factorization
   graph_ops::Int # number of graph operations (marker sets, linked list ops, fill-in, sorting)
   solve_flops::Int # number of floating-point operations per solve (2*nnz(L) + n)
@@ -206,6 +207,7 @@ function LimitedLDLFactorization(
     neg,
     true,
     force_posdef,
+    0,  # num_retries
     0,  # flops
     0,  # graph_ops
     0,  # solve_flops
@@ -291,6 +293,7 @@ function lldl_factorize!(
   S::LimitedLDLFactorization{Tf, Ti},
   T::SparseMatrixCSC{Tv, Ti};
   droptol::Tf = Tf(0),
+  max_increase_α::Int = 3,
 ) where {Tf <: Number, Tv <: Number, Ti <: Integer}
   n = size(T, 1)
   n != size(T, 2) && error("input matrix must be square")
@@ -351,7 +354,6 @@ function lldl_factorize!(
   if α > 0
     α = max(α, α_min)
   end
-  max_increase_α = 3
   nb_increase_α = 0
   if any(x -> x == 0, adiag)
     α = max(α, α_min)
@@ -447,6 +449,9 @@ function lldl_factorize!(
     @inbounds @simd for col in neg
       d[col] -= α
     end
+    if α != 0
+      total_flops += length(pos) + length(neg)
+    end
 
     # Attempt a factorization.
     (factorized, flops, graph_ops) = attempt_lldl!(
@@ -475,6 +480,7 @@ function lldl_factorize!(
   end
 
   S.__factorized = factorized
+  S.num_retries = nb_increase_α
 
   # Unscale L.
   if factorized
@@ -547,6 +553,7 @@ function lldl(
   droptol::Real = Tv(0),
   α::Number = 0,
   α_increase_factor::Number = 10,
+  max_increase_α::Int = 3,
   check_tril::Bool = true,
   force_posdef::Bool = false,
 ) where {Tv <: Number, Ti <: Integer, Tf <: Real}
@@ -560,7 +567,7 @@ function lldl(
     α_increase_factor = α_increase_factor,
     force_posdef = force_posdef,
   )
-  lldl_factorize!(S, T, droptol = Tf(droptol))
+  lldl_factorize!(S, T, droptol = Tf(droptol), max_increase_α = max_increase_α)
 end
 
 lldl(A::SparseMatrixCSC{Tv, Ti}; kwargs...) where {Tv <: Number, Ti <: Integer} =
